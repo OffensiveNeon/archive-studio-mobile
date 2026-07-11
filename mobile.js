@@ -614,9 +614,16 @@ async function viewChat(i) {
     </details>
     <div class="chat-messages" id="chat-messages"></div>
     <form id="chat-form">
-      <textarea id="chat-input" rows="1" placeholder="Ask about the selected documents…"></textarea>
+      <textarea id="chat-input" rows="2" placeholder="Ask about the selected documents…"></textarea>
       <button class="btn btn-primary">Send</button>
     </form>`;
+
+  const chatTa = $('#chat-input');
+  const growTa = () => {
+    chatTa.style.height = 'auto';
+    chatTa.style.height = chatTa.scrollHeight + 'px';
+  };
+  chatTa.oninput = growTa;
 
   const ctxList = $('#ctx-list');
   function renderCtxList(filter) {
@@ -656,13 +663,14 @@ async function viewChat(i) {
 
   $('#chat-form').onsubmit = async (e) => {
     e.preventDefault();
-    const q = $('#chat-input').value.trim();
+    const q = chatTa.value.trim();
     if (!q) return;
     if (!chat.selected.size) {
       chat.messages.push({ role: 'system', content: 'Select at least one document in the context picker above.' });
       renderMessages(); return;
     }
-    $('#chat-input').value = '';
+    chatTa.value = '';
+    growTa();
     chat.messages.push({ role: 'user', content: q });
     chat.messages.push({ role: 'thinking', content: 'Thinking…' });
     renderMessages();

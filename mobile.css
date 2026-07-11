@@ -199,7 +199,7 @@ textarea { resize: vertical; }
 .whole-lib input { width: auto; }
 .char-count { font-size: 13px; color: var(--text-muted); margin: 6px 0; }
 
-.chat-messages { padding: 4px 0 90px; }
+.chat-messages { padding: 4px 0 130px; }
 .bubble {
   margin: 10px 0;
   padding: 10px 16px;
@@ -237,7 +237,7 @@ textarea { resize: vertical; }
   background: var(--bg-panel);
   border-top: 1px solid var(--border);
 }
-#chat-form textarea { flex: 1; min-height: 42px; max-height: 130px; }
+#chat-form textarea { flex: 1; min-height: 68px; max-height: 40vh; resize: none; overflow-y: auto; }
 
 /* Slide-over reader */
 .slideover {
