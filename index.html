@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#16181d">
+  <title>Archive Studio</title>
+  <link rel="stylesheet" href="mobile.css">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon-192.png">
+  <script src="marked.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <button id="back-btn" class="btn btn-icon hidden" onclick="history.back()">‹</button>
+    <h1 id="topbar-title">Archive Studio</h1>
+    <span id="topbar-actions"></span>
+  </header>
+  <main id="view"></main>
+
+  <div id="slideover" class="slideover hidden">
+    <div class="slideover-header">
+      <button class="btn" onclick="closeSlideover()">✕ Close</button>
+    </div>
+    <div id="slideover-body"></div>
+  </div>
+
+  <script src="mobile.js"></script>
+</body>
+</html>
