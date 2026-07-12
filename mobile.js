@@ -291,6 +291,41 @@ function setTopbar(title, showBack, actionsHtml) {
   $('#topbar-actions').innerHTML = actionsHtml || '';
 }
 
+/* Monochrome Material-style icons (stroke = currentColor). */
+const ICONS = {
+  docs: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="4" y="3" width="16" height="18" rx="2.5"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>',
+  chat: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H3.5l2.6-3.2A8.5 8.5 0 1 1 21 11.5z"/><path d="M8 10h8M8 14h5"/></svg>',
+  send: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M3 20v-6l11-2L3 10V4l19 8-19 8z"/></svg>',
+};
+
+/* Card emoji: user-chosen in Settings, else picked from the library name. */
+const LIB_EMOJIS = ['📚', '🗞️', '📖', '🗂️', '📜', '🏛️', '🧭', '🌒', '🗃️', '🪶'];
+function libEmoji(lib) {
+  if (lib.emoji) return lib.emoji;
+  let h = 0;
+  for (const c of String(lib.name || '')) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return LIB_EMOJIS[h % LIB_EMOJIS.length];
+}
+
+/* Bottom tab bar (Docs | Chat) shown inside a library, like NotebookLM's
+ * Sources | Chat | Studio bar. Pass i=null to hide it. */
+function setBottomNav(i, active) {
+  const nav = $('#bottomnav');
+  if (i === null) {
+    nav.classList.add('hidden');
+    document.body.classList.remove('has-nav');
+    nav.innerHTML = '';
+    return;
+  }
+  nav.classList.remove('hidden');
+  document.body.classList.add('has-nav');
+  nav.innerHTML = `
+    <a class="nav-item ${active === 'docs' ? 'active' : ''}" href="#/lib/${i}">
+      <span class="nav-icon">${ICONS.docs}</span>Docs</a>
+    <a class="nav-item ${active === 'chat' ? 'active' : ''}" href="#/chat/${i}">
+      <span class="nav-icon">${ICONS.chat}</span>Chat</a>`;
+}
+
 /* ---------- clipboard + TTS ---------- */
 
 async function copyText(text, btn) {
@@ -399,7 +434,8 @@ function wireReader(root, doc) {
 
 async function viewHome() {
   setTopbar('Archive Studio', false,
-    `<button class="btn btn-small" onclick="location.hash='#/settings'">⚙ Settings</button>`);
+    `<button class="btn btn-icon" title="Settings" onclick="location.hash='#/settings'">⚙</button>`);
+  setBottomNav(null);
   const v = $('#view');
   if (!settings.libraries.length) {
     v.innerHTML = `
@@ -416,15 +452,21 @@ async function viewHome() {
     const status = meta
       ? `${meta.count} docs · synced ${new Date(meta.syncedAt).toLocaleDateString()}`
       : 'not downloaded yet';
-    $('#lib-cards').appendChild(el(`
-      <div class="card">
-        <h3>${esc(lib.name)}</h3>
-        <p class="muted">${esc(lib.repo)} · ${esc(status)}</p>
-        <div class="card-actions">
-          <button class="btn btn-primary" onclick="location.hash='#/lib/${i}'">📚 Browse</button>
-          <button class="btn" onclick="location.hash='#/chat/${i}'">💬 Chat</button>
+    const card = el(`
+      <div class="card tint-${i % 5}">
+        <span class="card-emoji">${esc(libEmoji(lib))}</span>
+        <div class="card-main">
+          <h3>${esc(lib.name)}</h3>
+          <p>${esc(status)}</p>
         </div>
-      </div>`));
+        <button class="card-chat" title="Chat">${ICONS.chat}</button>
+      </div>`);
+    card.onclick = () => { location.hash = `#/lib/${i}`; };
+    card.querySelector('.card-chat').onclick = (e) => {
+      e.stopPropagation();
+      location.hash = `#/chat/${i}`;
+    };
+    $('#lib-cards').appendChild(card);
   }
 }
 
@@ -437,8 +479,8 @@ async function viewLibrary(i) {
   if (!lib) { location.hash = ''; return; }
   const lk = libKey(lib);
   const st = listState[lk] = listState[lk] || { q: '', source: '', shown: 100 };
-  setTopbar(lib.name, true,
-    `<button class="btn btn-small" onclick="location.hash='#/chat/${i}'">💬 Chat</button>`);
+  setTopbar(lib.name, true, '');
+  setBottomNav(i, 'docs');
 
   const v = $('#view');
   const docs = await docsFor(lib);
@@ -544,6 +586,7 @@ async function viewDoc(i, path) {
   const docs = await docsFor(lib);
   let doc = docs.find(d => d.path === path);
   setTopbar(lib.name, true, '');
+  setBottomNav(i, 'docs');
   const v = $('#view');
   if (!doc) {
     v.innerHTML = '<p class="muted">Fetching document…</p>';
@@ -580,8 +623,9 @@ async function viewChat(i) {
   const lib = settings.libraries[i];
   if (!lib) { location.hash = ''; return; }
   const docs = await docsFor(lib);
-  setTopbar('Chat — ' + lib.name, true,
+  setTopbar(lib.name, true,
     `<button class="btn btn-small" id="new-chat">New chat</button>`);
+  setBottomNav(i, 'chat');
 
   if (!chat || chat.libIdx !== i) {
     chat = { libIdx: i, selected: new Set(), history: [], messages: [] };
@@ -614,8 +658,11 @@ async function viewChat(i) {
     </details>
     <div class="chat-messages" id="chat-messages"></div>
     <form id="chat-form">
-      <textarea id="chat-input" rows="2" placeholder="Ask about the selected documents…"></textarea>
-      <button class="btn btn-primary">Send</button>
+      <div class="chat-inputbox">
+        <textarea id="chat-input" rows="2" placeholder="Ask…"></textarea>
+        <button class="send-btn" title="Send">${ICONS.send}</button>
+      </div>
+      <p class="chat-disclaimer">Answers can be wrong — tap the [n] chips to check the sources.</p>
     </form>`;
 
   const chatTa = $('#chat-input');
@@ -646,6 +693,9 @@ async function viewChat(i) {
     $('#char-count').textContent = `${chat.selected.size} selected · ${chars.toLocaleString()} characters`;
     $('#ctx-summary').textContent = `Context: ${chat.selected.size} document${chat.selected.size === 1 ? '' : 's'} selected`;
     $('#whole-lib').checked = chat.selected.size === docs.length;
+    chatTa.placeholder = chat.selected.size
+      ? `Ask ${chat.selected.size} document${chat.selected.size === 1 ? '' : 's'}…`
+      : 'Select documents above, then ask…';
   }
   $('#whole-lib').onchange = (e) => {
     chat.selected = e.target.checked ? new Set(docs.map(d => d.path)) : new Set();
@@ -764,10 +814,12 @@ async function askOpenRouter(lib, selectedDocs, history, question) {
 
 function viewSettings() {
   setTopbar('Settings', true, '');
+  setBottomNav(null);
   const v = $('#view');
   const libRow = (lib, idx) => `
     <div class="lib-config" data-idx="${idx}">
       <label>Library name <input class="f-name" value="${esc(lib.name || '')}" placeholder="TLD News"></label>
+      <label>Emoji for the card (optional) <input class="f-emoji" value="${esc(lib.emoji || '')}" placeholder="📚"></label>
       <label>GitHub repo <input class="f-repo" value="${esc(lib.repo || '')}" placeholder="username/my-archive"></label>
       <label>Branch <input class="f-branch" value="${esc(lib.branch || 'main')}"></label>
       <label>Subfolder (optional) <input class="f-dir" value="${esc(lib.dir || '')}" placeholder="leave empty for whole repo"></label>
@@ -812,6 +864,7 @@ function viewSettings() {
   $('#save-settings').onclick = () => {
     const libs = [...v.querySelectorAll('.lib-config')].map(f => ({
       name: f.querySelector('.f-name').value.trim(),
+      emoji: f.querySelector('.f-emoji').value.trim(),
       repo: f.querySelector('.f-repo').value.trim().replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/$/, ''),
       branch: f.querySelector('.f-branch').value.trim() || 'main',
       dir: f.querySelector('.f-dir').value.trim(),
