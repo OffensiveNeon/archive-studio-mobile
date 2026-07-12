@@ -743,6 +743,12 @@ async function viewChat(i) {
     chatTa.style.height = chatTa.scrollHeight + 'px';
   };
   chatTa.oninput = growTa;
+  chatTa.onkeydown = (e) => {   // Enter sends; Shift+Enter for a newline
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      $('#chat-form').requestSubmit();
+    }
+  };
 
   const ctxList = $('#ctx-list');
   function renderCtxList(filter) {
@@ -948,10 +954,20 @@ async function askOpenRouter(selectedDocs, history, question) {
     ...history,
     { role: 'user', content: question },
   ];
-  const { msg, error } = await orCall(messages);
+  let { msg, error } = await orCall(messages);
   if (error) return { error };
-  return { answer: msg.content || '', sources };
+  let answer = (msg.content || '').trim();
+  if (!answer) {
+    // reasoning-only turn with empty content — nudge once for the answer
+    messages.push({ role: 'user', content: NUDGE });
+    ({ msg, error } = await orCall(messages));
+    if (error) return { error };
+    answer = (msg.content || '').trim();
+  }
+  return { answer, sources };
 }
+
+const NUDGE = 'Write your final answer now, citing the numbered sources as [n].';
 
 /* --- "whole library" mode: search-grounded chat, mirrors app/chat.py -------
  * Same agentic loop as desktop, but retrieval is client-side keyword scoring
@@ -1064,12 +1080,21 @@ async function askLibrary(docs, history, question, registry) {
   }
   messages.push(...history, { role: 'user', content: question });
 
+  let nudged = false;
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     // last round: keep tools in the payload but forbid calls to force an answer
     const { msg, error } = await orCall(messages, LIBRARY_TOOLS, round === MAX_TOOL_ROUNDS ? 'none' : '');
     if (error) return { error };
     const calls = msg.tool_calls || [];
-    if (!calls.length) return { answer: msg.content || '' };
+    if (!calls.length) {
+      const answer = (msg.content || '').trim();
+      if (answer) return { answer };
+      // empty final answer (reasoning-only turn) — nudge once
+      if (nudged) return { error: 'The model returned an empty answer twice — try asking again.' };
+      nudged = true;
+      messages.push({ role: 'user', content: NUDGE });
+      continue;
+    }
     messages.push(msg);
     for (const call of calls) {
       const fn = call.function || {};
