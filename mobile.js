@@ -40,10 +40,12 @@ let _db = null;
 function db() {
   if (_db) return Promise.resolve(_db);
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('archive-mobile', 1);
+    const req = indexedDB.open('archive-mobile', 2);
     req.onupgradeneeded = () => {
-      req.result.createObjectStore('docs', { keyPath: 'key' });
-      req.result.createObjectStore('meta', { keyPath: 'key' });
+      const d = req.result;
+      if (!d.objectStoreNames.contains('docs')) d.createObjectStore('docs', { keyPath: 'key' });
+      if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', { keyPath: 'key' });
+      if (!d.objectStoreNames.contains('chats')) d.createObjectStore('chats', { keyPath: 'id' });
     };
     req.onsuccess = () => { _db = req.result; resolve(_db); };
     req.onerror = () => reject(req.error);
@@ -78,6 +80,55 @@ function dbGetMeta(lk) {
 
 function dbPutMeta(rec) {
   return tx('meta', 'readwrite', s => s.put(rec));
+}
+
+/* ---------- saved chats (IndexedDB, mirrors desktop data/chats/) ---------- */
+
+function dbPutChat(c) { return tx('chats', 'readwrite', s => s.put(c)); }
+function dbGetChat(id) { return tx('chats', 'readonly', s => s.get(id)); }
+function dbDeleteChat(id) { return tx('chats', 'readwrite', s => s.delete(id)); }
+function dbChatsForLib(lk) {
+  return tx('chats', 'readonly', s => s.getAll())
+    .then(r => (r || []).filter(c => c.lib === lk)
+      .sort((a, b) => (a.updated < b.updated ? 1 : -1)));
+}
+
+/* which saved chat is open, per library */
+const CURRENT_CHAT_KEY = 'as-mobile-current-chat';
+
+function currentChatId(lk) {
+  try { return (JSON.parse(localStorage.getItem(CURRENT_CHAT_KEY)) || {})[lk] || ''; }
+  catch (e) { return ''; }
+}
+
+function setCurrentChatId(lk, id) {
+  let m = {};
+  try { m = JSON.parse(localStorage.getItem(CURRENT_CHAT_KEY)) || {}; } catch (e) {}
+  if (id) m[lk] = id; else delete m[lk];
+  localStorage.setItem(CURRENT_CHAT_KEY, JSON.stringify(m));
+}
+
+function newChatRec(lk) {
+  const now = new Date().toISOString();
+  return {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
+    lib: lk,
+    title: '',
+    mode: 'docs',
+    created: now,
+    updated: now,
+    messages: [],   // {role, content, sources?: [{n, path, title}]}
+    registry: [],   // library mode: stable chat-wide source numbers
+  };
+}
+
+function persistChat(rec) {
+  rec.updated = new Date().toISOString();
+  // system/thinking bubbles are transient — only real turns are saved
+  const clean = Object.assign({}, rec, {
+    messages: rec.messages.filter(m => m.role === 'user' || m.role === 'assistant'),
+  });
+  return dbPutChat(clean);
 }
 
 /* in-memory per-library doc list, invalidated on sync */
@@ -617,19 +668,32 @@ const STYLES = {
   natural: 'natural conversational prose, but still keep the inline [n] citations',
 };
 
-let chat = null;   // { libIdx, selected:Set<path>, history:[], messages:[] }
+let chat = null;   // runtime: { libIdx, rec, selected:Set<path> }
+
+async function loadOrNewChat(lk) {
+  const id = currentChatId(lk);
+  if (id) {
+    const rec = await dbGetChat(id).catch(() => null);
+    if (rec) return rec;
+  }
+  const rec = newChatRec(lk);
+  setCurrentChatId(lk, rec.id);
+  return rec;
+}
 
 async function viewChat(i) {
   const lib = settings.libraries[i];
   if (!lib) { location.hash = ''; return; }
+  const lk = libKey(lib);
   const docs = await docsFor(lib);
   setTopbar(lib.name, true,
     `<button class="btn btn-small" id="new-chat">New chat</button>`);
   setBottomNav(i, 'chat');
 
-  if (!chat || chat.libIdx !== i) {
-    chat = { libIdx: i, selected: new Set(), history: [], messages: [] };
+  if (!chat || chat.libIdx !== i || !chat.rec || chat.rec.id !== currentChatId(lk)) {
+    chat = { libIdx: i, rec: await loadOrNewChat(lk), selected: new Set() };
   }
+  const rec = chat.rec;
 
   const v = $('#view');
   if (!docs.length) {
@@ -646,7 +710,15 @@ async function viewChat(i) {
 
   const totalChars = docs.reduce((n, d) => n + d.body.length, 0);
   v.innerHTML = `
-    <details class="chat-context" ${chat.selected.size ? '' : 'open'}>
+    <details class="chat-saved">
+      <summary id="saved-summary">Saved chats</summary>
+      <div class="chat-saved-body" id="saved-list"></div>
+    </details>
+    <div class="chat-mode" id="chat-mode">
+      <label><input type="radio" name="cmode" value="docs"> Pick documents</label>
+      <label><input type="radio" name="cmode" value="library"> Whole library 🔎</label>
+    </div>
+    <details class="chat-context" id="ctx-details" ${chat.selected.size ? '' : 'open'}>
       <summary id="ctx-summary"></summary>
       <div class="chat-context-body">
         <label class="whole-lib"><input type="checkbox" id="whole-lib">
@@ -693,46 +765,103 @@ async function viewChat(i) {
     $('#char-count').textContent = `${chat.selected.size} selected · ${chars.toLocaleString()} characters`;
     $('#ctx-summary').textContent = `Context: ${chat.selected.size} document${chat.selected.size === 1 ? '' : 's'} selected`;
     $('#whole-lib').checked = chat.selected.size === docs.length;
-    chatTa.placeholder = chat.selected.size
-      ? `Ask ${chat.selected.size} document${chat.selected.size === 1 ? '' : 's'}…`
-      : 'Select documents above, then ask…';
+    chatTa.placeholder = rec.mode === 'library'
+      ? 'Ask the whole library…'
+      : chat.selected.size
+        ? `Ask ${chat.selected.size} document${chat.selected.size === 1 ? '' : 's'}…`
+        : 'Select documents above, then ask…';
   }
   $('#whole-lib').onchange = (e) => {
     chat.selected = e.target.checked ? new Set(docs.map(d => d.path)) : new Set();
     renderCtxList($('#ctx-q').value); updateCounts();
   };
   $('#ctx-q').oninput = () => renderCtxList($('#ctx-q').value);
+
+  /* mode toggle — locked once the chat has an answer, like desktop */
+  function syncModeUI() {
+    const locked = rec.messages.some(m => m.role === 'assistant');
+    document.querySelectorAll('#chat-mode input').forEach(r => {
+      r.checked = r.value === rec.mode;
+      r.disabled = locked;
+      r.onchange = () => { rec.mode = r.value; syncModeUI(); };
+    });
+    $('#ctx-details').classList.toggle('hidden', rec.mode === 'library');
+    updateCounts();
+    if (!rec.messages.length) renderMessages();   // mode-specific empty-state hint
+  }
+
+  async function renderSaved() {
+    const list = await dbChatsForLib(lk).catch(() => []);
+    $('#saved-summary').textContent = `Saved chats (${list.length})`;
+    const box = $('#saved-list');
+    box.innerHTML = list.length ? ''
+      : '<p class="muted">No saved chats yet — they save automatically as you chat.</p>';
+    for (const c of list) {
+      const row = el(`<div class="chat-saved-item ${c.id === rec.id ? 'active' : ''}">
+        <a class="chat-saved-title">${esc(c.title || '(untitled)')}</a>
+        <span class="muted">${esc((c.updated || '').slice(0, 10))}${c.mode === 'library' ? ' · 🔎' : ''}</span>
+        <button class="btn btn-small btn-danger del" title="Delete chat">✕</button>
+      </div>`);
+      row.querySelector('.chat-saved-title').onclick = () => {
+        setCurrentChatId(lk, c.id); chat = null; viewChat(i);
+      };
+      row.querySelector('.del').onclick = async () => {
+        await dbDeleteChat(c.id);
+        if (c.id === rec.id) { setCurrentChatId(lk, ''); chat = null; viewChat(i); }
+        else renderSaved();
+      };
+      box.appendChild(row);
+    }
+  }
+
   renderCtxList('');
-  updateCounts();
+  syncModeUI();
+  renderSaved();
   renderMessages();
 
   $('#new-chat').onclick = () => {
-    chat.history = []; chat.messages = [];
-    renderMessages();
+    setCurrentChatId(lk, ''); chat = null; viewChat(i);
   };
 
   $('#chat-form').onsubmit = async (e) => {
     e.preventDefault();
     const q = chatTa.value.trim();
     if (!q) return;
-    if (!chat.selected.size) {
-      chat.messages.push({ role: 'system', content: 'Select at least one document in the context picker above.' });
-      renderMessages(); return;
+    const isLib = rec.mode === 'library';
+    if (!isLib && !chat.selected.size) {
+      rec.messages.push({ role: 'system', content: 'Select at least one document in the context picker above.' });
+      renderMessages();
+      rec.messages.pop();
+      return;
     }
     chatTa.value = '';
     growTa();
-    chat.messages.push({ role: 'user', content: q });
-    chat.messages.push({ role: 'thinking', content: 'Thinking…' });
+    const history = rec.messages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role, content: m.content }));
+    rec.messages.push({ role: 'user', content: q });
+    rec.messages.push({ role: 'thinking', content: isLib ? 'Searching the library…' : 'Thinking…' });
     renderMessages();
-    const selectedDocs = docs.filter(d => chat.selected.has(d.path));
-    const { answer, sources, error } = await askOpenRouter(lib, selectedDocs, chat.history, q);
-    chat.messages.pop();  // remove thinking bubble
-    if (error) {
-      chat.messages.push({ role: 'system', content: error });
+    let answer, sources, error;
+    if (isLib) {
+      ({ answer, error } = await askLibrary(docs, history, q, rec.registry));
+      sources = rec.registry.map(s => Object.assign({}, s));
     } else {
-      chat.history.push({ role: 'user', content: q });
-      chat.history.push({ role: 'assistant', content: answer });
-      chat.messages.push({ role: 'assistant', content: answer, sources });
+      const selectedDocs = docs.filter(d => chat.selected.has(d.path));
+      ({ answer, sources, error } = await askOpenRouter(selectedDocs, history, q));
+    }
+    if (!error && !(answer || '').trim()) {
+      error = 'The model returned an empty answer — please ask again.';
+    }
+    rec.messages.pop();  // remove thinking bubble
+    if (error) {
+      rec.messages.push({ role: 'system', content: error });
+    } else {
+      rec.messages.push({ role: 'assistant', content: answer, sources });
+      if (!rec.title) rec.title = q.slice(0, 60) + (q.length > 60 ? '…' : '');
+      await persistChat(rec).catch(() => {});
+      renderSaved();
+      syncModeUI();
     }
     renderMessages();
   };
@@ -740,11 +869,13 @@ async function viewChat(i) {
   function renderMessages() {
     const box = $('#chat-messages');
     box.innerHTML = '';
-    if (!chat.messages.length) {
-      box.innerHTML = '<p class="empty">Pick documents above, then ask a question.<br>Answers cite sources as [1] chips you can tap.</p>';
+    if (!rec.messages.length) {
+      box.innerHTML = `<p class="empty">${rec.mode === 'library'
+        ? 'Ask anything — the assistant searches the whole library and cites [n] chips you can tap.'
+        : 'Pick documents above, then ask a question.<br>Answers cite sources as [1] chips you can tap.'}</p>`;
       return;
     }
-    chat.messages.forEach((m, mi) => {
+    rec.messages.forEach((m) => {
       if (m.role === 'user') {
         box.appendChild(el(`<div class="bubble bubble-user">${esc(m.content)}</div>`));
       } else if (m.role === 'system') {
@@ -754,13 +885,14 @@ async function viewChat(i) {
       } else {
         let html = md(m.content);
         html = html.replace(/\[(\d+)\]/g, (whole, n) =>
-          `<a class="cite-chip" data-mi="${mi}" data-n="${n}">${n}</a>`);
+          `<a class="cite-chip" data-n="${n}">${n}</a>`);
         const b = el(`<div class="bubble"><div class="bubble-body">${html}</div>
           <div class="bubble-actions"><button class="btn btn-small listen">🔊 Listen</button></div></div>`);
         b.querySelectorAll('.cite-chip').forEach(chip => {
           chip.onclick = () => {
-            const src = (m.sources || [])[Number(chip.dataset.n) - 1];
-            if (src) openSlideover(src.doc);
+            const src = (m.sources || []).find(s => s.n === Number(chip.dataset.n));
+            const d = src && docs.find(x => x.path === src.path);
+            if (d) openSlideover(d);
           };
         });
         b.querySelector('.listen').onclick = (ev) => toggleSpeech(m.content, ev.target);
@@ -771,21 +903,13 @@ async function viewChat(i) {
   }
 }
 
-/* mirrors app/chat.py: build numbered source blocks, call OpenRouter */
-async function askOpenRouter(lib, selectedDocs, history, question) {
-  const blocks = [], sources = [];
-  selectedDocs.forEach((d, idx) => {
-    const n = idx + 1;
-    blocks.push(`[Source ${n}: "${d.title}" — ${d.source}, ${d.date}, doc_id=${d.path}]\n${d.body}`);
-    sources.push({ n, doc: d });
-  });
-  const style = STYLES[settings.style] || STYLES.cited;
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPT.replace('{STYLE}', style) },
-    { role: 'user', content: 'SOURCES:\n\n' + blocks.join('\n\n') },
-    ...history,
-    { role: 'user', content: question },
-  ];
+/* one OpenRouter round; returns { msg } or { error } */
+async function orCall(messages, tools, toolChoice) {
+  const payload = { model: settings.model, messages, stream: false };
+  if (tools) {
+    payload.tools = tools;
+    if (toolChoice) payload.tool_choice = toolChoice;
+  }
   let r;
   try {
     r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -795,7 +919,7 @@ async function askOpenRouter(lib, selectedDocs, history, question) {
         'Content-Type': 'application/json',
         'X-Title': 'Archive Studio Mobile',
       },
-      body: JSON.stringify({ model: settings.model, messages, stream: false }),
+      body: JSON.stringify(payload),
     });
   } catch (e) {
     return { error: 'Request failed: ' + e.message };
@@ -803,11 +927,162 @@ async function askOpenRouter(lib, selectedDocs, history, question) {
   const text = await r.text();
   if (!r.ok) return { error: `OpenRouter error ${r.status}: ${text.slice(0, 2000)}` };
   try {
-    const answer = JSON.parse(text).choices[0].message.content;
-    return { answer, sources };
+    return { msg: JSON.parse(text).choices[0].message };
   } catch (e) {
     return { error: 'Unexpected API response: ' + text.slice(0, 2000) };
   }
+}
+
+/* mirrors app/chat.py: build numbered source blocks, call OpenRouter */
+async function askOpenRouter(selectedDocs, history, question) {
+  const blocks = [], sources = [];
+  selectedDocs.forEach((d, idx) => {
+    const n = idx + 1;
+    blocks.push(`[Source ${n}: "${d.title}" — ${d.source}, ${d.date}, doc_id=${d.path}]\n${d.body}`);
+    sources.push({ n, path: d.path, title: d.title });
+  });
+  const style = STYLES[settings.style] || STYLES.cited;
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT.replace('{STYLE}', style) },
+    { role: 'user', content: 'SOURCES:\n\n' + blocks.join('\n\n') },
+    ...history,
+    { role: 'user', content: question },
+  ];
+  const { msg, error } = await orCall(messages);
+  if (error) return { error };
+  return { answer: msg.content || '', sources };
+}
+
+/* --- "whole library" mode: search-grounded chat, mirrors app/chat.py -------
+ * Same agentic loop as desktop, but retrieval is client-side keyword scoring
+ * over the docs already cached in IndexedDB (no FTS index in the browser). */
+
+const LIBRARY_SYSTEM_PROMPT =
+  'You are a research assistant answering questions about a markdown archive ' +
+  'library. You cannot see the documents directly — use the tools:\n' +
+  '- search_library(query): full-text search, returns matching documents with ' +
+  'snippets. Use short keyword queries (2-4 words), not full sentences. Try ' +
+  'multiple queries with different terms if the first misses.\n' +
+  '- read_document(doc_id): read one document in full. Each document you read ' +
+  'becomes a numbered source you can cite.\n\n' +
+  'ALWAYS search before answering. Read the documents that look most relevant ' +
+  '(usually 2-5) before writing your answer. Every factual claim MUST carry an ' +
+  'inline citation like [3] or [1][4] referring to the numbered sources you ' +
+  'have read (including ones listed as already read earlier in the ' +
+  'conversation). Never cite a document you have not read. If the library ' +
+  'does not contain the answer, say so plainly.\n' +
+  'Style: {STYLE}.';
+
+const LIBRARY_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'search_library',
+      description: 'Full-text keyword search over the library. Returns doc_id, title, date and a snippet for each hit.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Keywords to search for (2-4 words work best).' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_document',
+      description: 'Read a document in full by doc_id (from search results). It becomes a citable numbered source.',
+      parameters: {
+        type: 'object',
+        properties: {
+          doc_id: { type: 'string', description: 'The doc_id exactly as returned by search_library.' },
+        },
+        required: ['doc_id'],
+      },
+    },
+  },
+];
+
+const MAX_TOOL_ROUNDS = 8;
+const SEARCH_LIMIT = 8;
+const DOC_CHAR_CAP = 20000;
+
+function searchLocal(docs, query) {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return [];
+  const scored = [];
+  for (const d of docs) {
+    const title = d.title.toLowerCase(), body = d.body.toLowerCase();
+    let score = 0, firstIdx = -1;
+    for (const t of terms) {
+      if (title.includes(t)) score += 5;
+      let idx = body.indexOf(t), c = 0;
+      if (idx !== -1 && (firstIdx < 0 || idx < firstIdx)) firstIdx = idx;
+      while (idx !== -1 && c < 50) { c++; idx = body.indexOf(t, idx + t.length); }
+      score += c;
+    }
+    if (score > 0) scored.push({ d, score, firstIdx: Math.max(firstIdx, 0) });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, SEARCH_LIMIT).map(({ d, firstIdx }) => {
+    const start = Math.max(0, firstIdx - 80);
+    const snippet = d.body.slice(start, start + 220).replace(/\s+/g, ' ').trim();
+    return { d, snippet };
+  });
+}
+
+function runSearchTool(docs, query) {
+  const hits = searchLocal(docs, query);
+  if (!hits.length) return 'No matches. Try different or fewer keywords.';
+  return hits.map(h => `doc_id=${h.d.path}\n  "${h.d.title}" (${h.d.date}) — ${h.snippet}`).join('\n');
+}
+
+function runReadTool(docs, path, registry) {
+  const d = docs.find(x => x.path === path);
+  if (!d) return 'Error: no such document. Use a doc_id from search_library results.';
+  let s = registry.find(x => x.path === d.path);
+  if (!s) {
+    s = { n: registry.length + 1, path: d.path, title: d.title };
+    registry.push(s);
+  }
+  let body = d.body;
+  if (body.length > DOC_CHAR_CAP) body = body.slice(0, DOC_CHAR_CAP) + '\n\n[... truncated ...]';
+  return `[Source ${s.n}: "${d.title}" — ${d.source}, ${d.date}]\n${body}`;
+}
+
+/* Mutates registry (stable chat-wide source numbers). Returns {answer} or {error}. */
+async function askLibrary(docs, history, question, registry) {
+  const style = STYLES[settings.style] || STYLES.cited;
+  const messages = [{ role: 'system', content: LIBRARY_SYSTEM_PROMPT.replace('{STYLE}', style) }];
+  if (registry.length) {
+    messages.push({
+      role: 'user',
+      content: 'Sources already read earlier in this conversation:\n' +
+        registry.map(s => `[${s.n}] "${s.title}"`).join('\n'),
+    });
+  }
+  messages.push(...history, { role: 'user', content: question });
+
+  for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+    // last round: keep tools in the payload but forbid calls to force an answer
+    const { msg, error } = await orCall(messages, LIBRARY_TOOLS, round === MAX_TOOL_ROUNDS ? 'none' : '');
+    if (error) return { error };
+    const calls = msg.tool_calls || [];
+    if (!calls.length) return { answer: msg.content || '' };
+    messages.push(msg);
+    for (const call of calls) {
+      const fn = call.function || {};
+      let args = {};
+      try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
+      let out;
+      if (fn.name === 'search_library') out = runSearchTool(docs, String(args.query || ''));
+      else if (fn.name === 'read_document') out = runReadTool(docs, String(args.doc_id || ''), registry);
+      else out = `Unknown tool ${fn.name}.`;
+      messages.push({ role: 'tool', tool_call_id: call.id || '', content: out });
+    }
+  }
+  return { error: 'Model kept calling tools past the round limit.' };
 }
 
 /* --- settings --- */
