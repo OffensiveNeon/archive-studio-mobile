@@ -15,11 +15,11 @@ function loadSettings() {
     return {
       libraries: s.libraries || [],
       key: s.key || '',
-      model: s.model || 'anthropic/claude-sonnet-4.6',
+      model: s.model || 'anthropic/claude-haiku-4.5',
       style: s.style || 'cited',
     };
   } catch (e) {
-    return { libraries: [], key: '', model: 'anthropic/claude-sonnet-4.6', style: 'cited' };
+    return { libraries: [], key: '', model: 'anthropic/claude-haiku-4.5', style: 'cited' };
   }
 }
 
@@ -975,19 +975,62 @@ const NUDGE = 'Write your final answer now, citing the numbered sources as [n].'
 
 const LIBRARY_SYSTEM_PROMPT =
   'You are a research assistant answering questions about a markdown archive ' +
-  'library. You cannot see the documents directly — use the tools:\n' +
-  '- search_library(query): full-text search, returns matching documents with ' +
-  'snippets. Use short keyword queries (2-4 words), not full sentences. Try ' +
-  'multiple queries with different terms if the first misses.\n' +
-  '- read_document(doc_id): read one document in full. Each document you read ' +
-  'becomes a numbered source you can cite.\n\n' +
-  'ALWAYS search before answering. Read the documents that look most relevant ' +
-  '(usually 2-5) before writing your answer. Every factual claim MUST carry an ' +
-  'inline citation like [3] or [1][4] referring to the numbered sources you ' +
-  'have read (including ones listed as already read earlier in the ' +
-  'conversation). Never cite a document you have not read. If the library ' +
-  'does not contain the answer, say so plainly.\n' +
+  'library. A LIBRARY CATALOG (one line per document: date | title | doc_id — ' +
+  'opening excerpt) may be provided below. You cannot see full documents ' +
+  'directly — use the tools:\n' +
+  '- read_document(doc_id): read one document in full. Prefer picking doc_ids ' +
+  'straight from the catalog. Each document you read becomes a numbered source ' +
+  'you can cite.\n' +
+  '- search_library(query): full-text keyword search with snippets, ranked by ' +
+  'relevance. Use it when the catalog is not enough to tell which documents ' +
+  'matter — short keyword queries (2-4 words) work best.\n\n' +
+  'Read the documents that look most relevant (usually 2-5) before writing ' +
+  'your answer. Every factual claim MUST carry an inline citation like [3] or ' +
+  '[1][4] referring to the numbered sources you have read (including ones ' +
+  'listed as already read earlier in the conversation). Never cite a document ' +
+  'you have not read. If the library does not contain the answer, say so ' +
+  'plainly.\n' +
   'Style: {STYLE}.';
+
+const CATALOG_CHAR_CAP = 400000;
+
+function catalogExcerpt(body, limit) {
+  let text = body
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/^#{1,6}\s+.*$/gm, '')
+    .replace(/[*_`>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return text.length > limit ? text.slice(0, limit) + '…' : text;
+}
+
+/* Readable table of contents (mirrors app/indexer.py catalog()) — gives the
+ * model a macro view so it reads the right docs instead of searching blind. */
+function buildCatalog(docs) {
+  let text = docs.map(d => `${d.date} | ${d.title} | doc_id=${d.path} — ${catalogExcerpt(d.body, 90)}`).join('\n');
+  if (text.length > CATALOG_CHAR_CAP) {
+    text = docs.map(d => `${d.date} | ${d.title} | doc_id=${d.path}`).join('\n');
+  }
+  return text.length > CATALOG_CHAR_CAP ? '' : text;
+}
+
+/* Move a prompt-cache breakpoint onto the newest tool result so each loop
+ * round re-reads earlier rounds from the cache (Anthropic caching via
+ * OpenRouter; ignored by providers without it). */
+function markToolCache(messages) {
+  let last = null;
+  for (const m of messages) {
+    if (m.role === 'tool') {
+      if (Array.isArray(m.content)) m.content.forEach(b => { delete b.cache_control; });
+      last = m;
+    }
+  }
+  if (!last) return;
+  if (typeof last.content === 'string') last.content = [{ type: 'text', text: last.content }];
+  last.content[last.content.length - 1].cache_control = { type: 'ephemeral' };
+}
 
 const LIBRARY_TOOLS = [
   {
@@ -1071,6 +1114,14 @@ function runReadTool(docs, path, registry) {
 async function askLibrary(docs, history, question, registry) {
   const style = STYLES[settings.style] || STYLES.cited;
   const messages = [{ role: 'system', content: LIBRARY_SYSTEM_PROMPT.replace('{STYLE}', style) }];
+  const cat = buildCatalog(docs);
+  if (cat) {
+    // stable prefix shared by every question on this library — cache it
+    messages.push({
+      role: 'user',
+      content: [{ type: 'text', text: 'LIBRARY CATALOG:\n\n' + cat, cache_control: { type: 'ephemeral' } }],
+    });
+  }
   if (registry.length) {
     messages.push({
       role: 'user',
@@ -1083,6 +1134,7 @@ async function askLibrary(docs, history, question, registry) {
   let nudged = false;
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     // last round: keep tools in the payload but forbid calls to force an answer
+    markToolCache(messages);
     const { msg, error } = await orCall(messages, LIBRARY_TOOLS, round === MAX_TOOL_ROUNDS ? 'none' : '');
     if (error) return { error };
     const calls = msg.tool_calls || [];
@@ -1173,7 +1225,7 @@ function viewSettings() {
     saveSettings({
       libraries: libs,
       key: $('#f-key').value.trim(),
-      model: $('#f-model').value.trim() || 'anthropic/claude-sonnet-4.6',
+      model: $('#f-model').value.trim() || 'anthropic/claude-haiku-4.5',
       style: $('#f-style').value,
     });
     $('#save-msg').textContent = 'Saved ✓';
