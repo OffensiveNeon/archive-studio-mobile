@@ -846,11 +846,13 @@ async function viewChat(i) {
       .filter(m => m.role === 'user' || m.role === 'assistant')
       .map(m => ({ role: m.role, content: m.content }));
     rec.messages.push({ role: 'user', content: q });
-    rec.messages.push({ role: 'thinking', content: isLib ? 'Searching the library…' : 'Thinking…' });
+    const think = { role: 'thinking', content: isLib ? 'Searching the library…' : 'Thinking…' };
+    rec.messages.push(think);
     renderMessages();
     let answer, sources, error;
     if (isLib) {
-      ({ answer, error } = await askLibrary(docs, history, q, rec.registry));
+      ({ answer, error } = await askLibrary(docs, history, q, rec.registry,
+        (t) => { think.content = t; renderMessages(); }));
       sources = rec.registry.map(s => Object.assign({}, s));
     } else {
       const selectedDocs = docs.filter(d => chat.selected.has(d.path));
@@ -1097,9 +1099,10 @@ function runSearchTool(docs, query) {
   return hits.map(h => `doc_id=${h.d.path}\n  "${h.d.title}" (${h.d.date}) — ${h.snippet}`).join('\n');
 }
 
-function runReadTool(docs, path, registry) {
+function runReadTool(docs, path, registry, note) {
   const d = docs.find(x => x.path === path);
   if (!d) return 'Error: no such document. Use a doc_id from search_library results.';
+  if (note) note(`Reading “${d.title}”…`);
   let s = registry.find(x => x.path === d.path);
   if (!s) {
     s = { n: registry.length + 1, path: d.path, title: d.title };
@@ -1110,8 +1113,10 @@ function runReadTool(docs, path, registry) {
   return `[Source ${s.n}: "${d.title}" — ${d.source}, ${d.date}]\n${body}`;
 }
 
-/* Mutates registry (stable chat-wide source numbers). Returns {answer} or {error}. */
-async function askLibrary(docs, history, question, registry) {
+/* Mutates registry (stable chat-wide source numbers). Returns {answer} or {error}.
+ * onStatus(text), when given, receives live progress for the thinking bubble. */
+async function askLibrary(docs, history, question, registry, onStatus) {
+  const note = onStatus || (() => {});
   const style = STYLES[settings.style] || STYLES.cited;
   const messages = [{ role: 'system', content: LIBRARY_SYSTEM_PROMPT.replace('{STYLE}', style) }];
   const cat = buildCatalog(docs);
@@ -1135,6 +1140,7 @@ async function askLibrary(docs, history, question, registry) {
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
     // last round: keep tools in the payload but forbid calls to force an answer
     markToolCache(messages);
+    note(round === 0 && cat ? 'Reading the library catalog…' : 'Thinking…');
     const { msg, error } = await orCall(messages, LIBRARY_TOOLS, round === MAX_TOOL_ROUNDS ? 'none' : '');
     if (error) return { error };
     const calls = msg.tool_calls || [];
@@ -1144,6 +1150,7 @@ async function askLibrary(docs, history, question, registry) {
       // empty final answer (reasoning-only turn) — nudge once
       if (nudged) return { error: 'The model returned an empty answer twice — try asking again.' };
       nudged = true;
+      note('Writing the answer…');
       messages.push({ role: 'user', content: NUDGE });
       continue;
     }
@@ -1153,8 +1160,12 @@ async function askLibrary(docs, history, question, registry) {
       let args = {};
       try { args = JSON.parse(fn.arguments || '{}'); } catch (e) {}
       let out;
-      if (fn.name === 'search_library') out = runSearchTool(docs, String(args.query || ''));
-      else if (fn.name === 'read_document') out = runReadTool(docs, String(args.doc_id || ''), registry);
+      if (fn.name === 'search_library') {
+        const q = String(args.query || '');
+        note(`Searching the library for “${q}”…`);
+        out = runSearchTool(docs, q);
+      }
+      else if (fn.name === 'read_document') out = runReadTool(docs, String(args.doc_id || ''), registry, note);
       else out = `Unknown tool ${fn.name}.`;
       messages.push({ role: 'tool', tool_call_id: call.id || '', content: out });
     }

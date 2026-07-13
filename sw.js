@@ -1,6 +1,6 @@
 /* Cache the app shell so the app opens offline (documents are cached
  * separately in IndexedDB by mobile.js). Bump VERSION on deploy. */
-const VERSION = 'as-mobile-v6';
+const VERSION = 'as-mobile-v7';
 const SHELL = ['./', 'index.html', 'mobile.css', 'mobile.js', 'marked.min.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
